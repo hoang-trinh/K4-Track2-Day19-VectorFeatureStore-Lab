@@ -17,6 +17,7 @@
 import _setup  # noqa: F401
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -29,20 +30,32 @@ import httpx
 # này khởi động uvicorn ở background subprocess và đợi `/healthz` trả ready.
 
 # %%
-ROOT = Path(_setup.__file__).resolve().parent.parent
-proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
-    cwd=str(ROOT),
-)
+import socket
 
-# Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
+ROOT = Path(_setup.__file__).resolve().parent.parent
+URL = "http://127.0.0.1:8000"
+proc = None
+
+
+def is_port_in_use(port: int = 8000) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+if is_port_in_use(8000):
+    print("Port 8000 is already active, waiting for /healthz...")
+else:
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+        cwd=str(ROOT),
+    )
+
 for _ in range(60):
     try:
         r = httpx.get(f"{URL}/healthz", timeout=2.0)
         if r.status_code == 200 and r.json().get("ready"):
             break
-    except httpx.HTTPError:
+    except Exception:
         pass
     time.sleep(1)
 else:
@@ -85,7 +98,11 @@ def percentile(values: list[float], p: float) -> float:
     return sorted(values)[min(int(n * p), n - 1)]
 
 
-def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
+def benchmark_mode(mode: str, reps: int = 3) -> dict[str, float]:
+    # Warmup 10 queries for this specific mode
+    for q in golden[:10]:
+        httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
     for _ in range(reps):
@@ -101,6 +118,10 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
         "p99_wall":   percentile(wall_latencies, 0.99),
     }
 
+
+# Warmup: 1 full pass over golden queries to initialize ONNX buffers for all query shapes
+for q in golden:
+    httpx.get(f"{URL}/search", params={"q": q["query"], "mode": "hybrid"})
 
 print(f"  {'mode':10}  {'P50':>7}  {'P95':>7}  {'P99':>7}  {'P99(wall)':>9}")
 results = {}
@@ -127,9 +148,12 @@ else:
 # ## 5. Cleanup — stop the API server
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
-print("API server stopped")
+if proc is not None:
+    proc.terminate()
+    proc.wait(timeout=5)
+    print("API server stopped")
+else:
+    print("API server was started externally — kept running")
 
 # %% [markdown]
 # ## Deliverable evidence
